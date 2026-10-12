@@ -10,9 +10,11 @@ import platform
 import re
 import socket
 import subprocess
+import ipaddress
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request
@@ -45,6 +47,39 @@ def load_services():
         return json.load(f)
 
 
+DEVICES_FILE = BASE / "devices.json"   # other computers found by network scans
+
+
+def load_devices():
+    try:
+        with open(DEVICES_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_devices(devices):
+    tmp = BASE / "devices.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(devices, f, indent=2)
+        f.write("\n")
+    tmp.replace(DEVICES_FILE)
+
+
+def remember_devices(found, names, replace_ports=True):
+    """Merge scan results ({ip: [ports]}) into devices.json, keeping names you've given devices."""
+    now = time.time()
+    with _lock:
+        devices = load_devices()
+        for ip, ports in found.items():
+            d = devices.setdefault(ip, {"first_seen": now})
+            d["ports"] = sorted(set(ports) if replace_ports else set(ports) | set(d.get("ports", [])))
+            d["last_seen"] = now
+            if names.get(ip):
+                d["hostname"] = names[ip]
+        save_devices(devices)
+
+
 def save_services(services):
     """Write services.json safely: write a temp file, then swap it in."""
     tmp = BASE / "services.json.tmp"
@@ -75,6 +110,13 @@ def clean_service(data):
             return None, "Port must be a number from 1 to 65535."
         svc["port"] = int(port)
 
+    host = str(data.get("host", "")).strip()
+    if host:
+        # An IP address or a computer name on your network, like 192.168.1.50 or nas.local
+        if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,253}", host):
+            return None, "Host should be an IP address like 192.168.1.50 or a computer name."
+        svc["host"] = host
+
     service = str(data.get("service", "")).strip()
     if service:
         # Windows service names: letters, digits, spaces, and a few symbols. No quotes or shell characters.
@@ -84,6 +126,10 @@ def clean_service(data):
 
     if not port and not service:
         return None, "Add a port, a Windows service name, or both, so there's something to check."
+    if host and not port:
+        return None, "A service on another computer needs a port to check."
+    if host and service:
+        return None, "Start / Stop only works for services on this PC. Clear the Windows service name or the host."
 
     path = str(data.get("path", "")).strip()
     if path:
@@ -100,14 +146,92 @@ def clean_service(data):
     return svc, None
 
 
-def check_port(port):
-    """Milliseconds to connect to this port on this machine, or None if nothing answers."""
-    start = time.perf_counter()
+_lan_cache = (0.0, [])
+
+
+def lan_addresses():
+    """This PC's own IPv4 network addresses (like 192.168.1.222), cached for a minute."""
+    global _lan_cache
+    if time.time() - _lan_cache[0] < 60:
+        return _lan_cache[1]
+    addrs = []
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.8):
-            return round((time.perf_counter() - start) * 1000, 1)
+        if psutil:
+            for nic in psutil.net_if_addrs().values():
+                addrs += [a.address for a in nic if a.family == socket.AF_INET]
+        else:
+            addrs = socket.gethostbyname_ex(socket.gethostname())[2]
     except OSError:
-        return None
+        pass
+    addrs = [a for a in dict.fromkeys(addrs) if not a.startswith(("127.", "169.254."))]
+    _lan_cache = (time.time(), addrs)
+    return addrs
+
+
+_owners_cache = (0.0, {})
+
+
+def windows_services():
+    """Installed Windows services as dicts (name, display_name, status, pid, binary). Empty off Windows."""
+    if not (psutil and IS_WINDOWS):
+        return []
+    out = []
+    for svc in psutil.win_service_iter():
+        try:
+            info = svc.as_dict()
+        except Exception:
+            continue
+        out.append({"name": info["name"], "display_name": info.get("display_name") or info["name"],
+                    "status": info.get("status"), "start_type": info.get("start_type"),
+                    "pid": info.get("pid"), "binary": info.get("binpath") or ""})
+    return out
+
+
+def port_owners():
+    """Which program (and Windows service, if any) is listening on each local port. Cached for 30s."""
+    global _owners_cache
+    if not psutil:
+        return {}
+    if time.time() - _owners_cache[0] < 30:
+        return _owners_cache[1]
+    by_pid = {s["pid"]: s for s in windows_services() if s["pid"]}
+    owners = {}
+    try:
+        conns = psutil.net_connections(kind="tcp")
+    except psutil.AccessDenied:
+        conns = []
+    for c in conns:
+        if c.status != psutil.CONN_LISTEN or not c.laddr or c.laddr.port in owners:
+            continue
+        process = ""
+        if c.pid:
+            try:
+                process = psutil.Process(c.pid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        svc = by_pid.get(c.pid)
+        owners[c.laddr.port] = {"process": process, "pid": c.pid,
+                                "service": svc["name"] if svc else None,
+                                "display_name": svc["display_name"] if svc else None}
+    _owners_cache = (time.time(), owners)
+    return owners
+
+
+def check_port(port, host=None):
+    """Connect to a port. Returns (milliseconds, address that answered), or (None, None).
+
+    With no host it checks this PC: localhost first, then the PC's network addresses,
+    because some programs only listen on their network address (192.168.x.x).
+    """
+    hosts = [host] if host else ["127.0.0.1", *lan_addresses()]
+    for host in hosts:
+        start = time.perf_counter()
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0 if len(hosts) == 1 else 0.5):
+                return round((time.perf_counter() - start) * 1000, 1), host
+        except OSError:
+            continue
+    return None, None
 
 
 def sc(*args):
@@ -150,9 +274,17 @@ def check_all():
         sid = s["id"]
         seen.add(sid)
         port = s.get("port")
-        state = service_state(s.get("service"))
-        latency = check_port(port) if port else None
+        remote = s.get("host")
+        state = None if remote else service_state(s.get("service"))
+        latency, answered_on = check_port(port, remote) if port else (None, None)
         up = latency is not None if port else state == "running"
+
+        # If the Windows service name is missing or wrong, look up the real one from the port.
+        suggested = None
+        if port and up and not remote and IS_WINDOWS and state in (None, "not installed"):
+            owner = port_owners().get(int(port)) or {}
+            if owner.get("service") and owner["service"] != s.get("service"):
+                suggested = {"service": owner["service"], "display_name": owner["display_name"]}
 
         with _lock:
             hist = _history.setdefault(sid, deque(maxlen=HISTORY_SIZE))
@@ -171,10 +303,14 @@ def check_all():
                 "port": port,
                 "path": s.get("path", "/"),
                 "public_url": s.get("public_url"),
-                "controllable": bool(IS_WINDOWS and s.get("service")),
+                "host": remote,
+                "controllable": bool(IS_WINDOWS and s.get("service") and not remote),
                 "state": state,
                 "up": bool(up),
                 "latency": latency,
+                # Address to use in links: None means localhost works, else the network address that answered.
+                "suggested_service": suggested,
+                "open_host": remote or (answered_on if answered_on and answered_on != "127.0.0.1" else None),
                 "avg_latency": round(sum(latencies) / len(latencies), 1) if latencies else None,
                 "uptime": round(100 * ups / len(hist), 1),
                 "since": since,
@@ -348,34 +484,20 @@ SYSTEM_PORTS = {135, 137, 138, 139, 445, 5040, 5357, 7680, 49664, 49665, 49666, 
 def discover():
     """Find listening TCP ports and installed Windows services on this PC."""
     tracked = load_services()
-    tracked_ports = {s.get("port") for s in tracked if s.get("port")}
+    tracked_ports = {s.get("port") for s in tracked if s.get("port") and not s.get("host")}
     tracked_services = {s.get("service", "").lower() for s in tracked if s.get("service")}
     own_pid = os.getpid()
 
     # Windows services, keyed by the process that runs them.
     services, service_by_pid = [], {}
-    if IS_WINDOWS:
-        for svc in psutil.win_service_iter():
-            try:
-                info = svc.as_dict()
-            except Exception:
-                continue
-            row = {
-                "name": info["name"],
-                "display_name": info.get("display_name") or info["name"],
-                "status": info.get("status"),
-                "start_type": info.get("start_type"),
-                "pid": info.get("pid"),
-                "binary": info.get("binpath") or "",
-                "tracked": info["name"].lower() in tracked_services,
-                "ports": [],
-            }
-            # Services living inside svchost or Windows folders are Windows' own.
-            binary = row["binary"].lower()
-            row["system"] = "svchost.exe" in binary or "\\windows\\" in binary
-            services.append(row)
-            if row["pid"]:
-                service_by_pid.setdefault(row["pid"], row)
+    for info in windows_services():
+        row = {**info, "tracked": info["name"].lower() in tracked_services, "ports": []}
+        # Services living inside svchost or Windows folders are Windows' own.
+        binary = row["binary"].lower()
+        row["system"] = "svchost.exe" in binary or "\\windows\\" in binary
+        services.append(row)
+        if row["pid"]:
+            service_by_pid.setdefault(row["pid"], row)
 
     ports, seen = [], set()
     try:
@@ -412,6 +534,237 @@ def discover():
     ports.sort(key=lambda r: r["port"])
     services.sort(key=lambda r: (r["status"] != "running", r["display_name"].lower()))
     return {"ports": ports, "services": services, "windows": IS_WINDOWS}
+
+
+# Ports worth looking for on other devices, with a guess at what usually runs there.
+COMMON_PORTS = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 53: "DNS", 80: "Web", 139: "File sharing", 443: "Web (HTTPS)",
+    445: "File sharing", 554: "Camera stream", 1883: "MQTT", 1900: "UPnP", 3000: "Web app", 3389: "Remote Desktop",
+    5000: "Web app / Synology", 5001: "Synology (HTTPS)", 5900: "VNC", 6789: "Web app", 7878: "Radarr",
+    8000: "Web app", 8080: "Web", 8081: "Web", 8085: "Libre Hardware Monitor", 8088: "Web", 8096: "Jellyfin",
+    8123: "Home Assistant", 8200: "Duplicati", 8384: "Syncthing", 8443: "Web (HTTPS)", 8920: "Jellyfin (HTTPS)",
+    8989: "Sonarr", 9000: "Portainer", 9090: "Cockpit / Prometheus", 9443: "Portainer (HTTPS)",
+    9696: "Prowlarr", 32400: "Plex", 51413: "Transmission",
+}
+WEB_PORTS = {80, 443, 3000, 5000, 5001, 6789, 7878, 8000, 8080, 8081, 8085, 8088, 8096, 8123, 8200,
+             8384, 8443, 8920, 8989, 9000, 9090, 9443, 9696, 32400}
+
+_scan = {"running": False, "done": 0, "total": 0, "devices": [], "started": None, "finished": None, "error": None}
+
+
+def lan_networks():
+    """The /24 networks this PC is on, like 192.168.1.0/24. Skips VPN-sized or public ranges."""
+    nets = []
+    for addr in lan_addresses():
+        ip = ipaddress.ip_address(addr)
+        if ip.is_private:
+            nets.append(ipaddress.ip_network(f"{addr}/24", strict=False))
+    return list(dict.fromkeys(nets))
+
+
+def _probe(ip, port):
+    try:
+        with socket.create_connection((ip, port), timeout=0.35):
+            return True
+    except OSError:
+        return False
+
+
+def _name_of(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (OSError, UnicodeError):
+        return None
+
+
+def run_scan(ports):
+    own = set(lan_addresses())
+    targets = [str(ip) for net in lan_networks() for ip in net.hosts() if str(ip) not in own]
+    jobs = [(ip, port) for ip in targets for port in ports]
+    with _lock:
+        _scan.update(running=True, done=0, total=len(jobs), devices=[], started=time.time(),
+                     finished=None, error=None if targets else "Couldn't find your home network address.")
+    found = {}
+    try:
+        with ThreadPoolExecutor(max_workers=256) as pool:
+            for (ip, port), is_open in zip(jobs, pool.map(lambda j: _probe(*j), jobs)):
+                if is_open:
+                    found.setdefault(ip, []).append(port)
+                with _lock:
+                    _scan["done"] += 1
+            names = dict(zip(found, pool.map(_name_of, list(found))))
+    except Exception as e:
+        with _lock:
+            _scan.update(error=f"Scan failed: {e}")
+        names = {}
+
+    tracked = {(s.get("host"), s.get("port")) for s in load_services() if s.get("host")}
+    devices = []
+    for ip in sorted(found, key=lambda a: ipaddress.ip_address(a)):
+        devices.append({
+            "ip": ip,
+            "name": names.get(ip),
+            "ports": [{"port": p, "label": COMMON_PORTS.get(p, ""), "web": p in WEB_PORTS,
+                       "tracked": (ip, p) in tracked or (names.get(ip), p) in tracked}
+                      for p in sorted(found[ip])],
+        })
+    with _lock:
+        _scan.update(running=False, devices=devices, finished=time.time())
+    remember_devices(found, names)
+    log_event("action", f"Network scan found {len(devices)} device{'s' if len(devices) != 1 else ''}")
+
+
+@app.post("/api/scan")
+def start_scan():
+    require_dashboard_header()
+    body = request.get_json(silent=True) or {}
+    extra = [int(p) for p in re.findall(r"\d+", str(body.get("ports", ""))) if 1 <= int(p) <= 65535]
+    ports = sorted(set(COMMON_PORTS) | set(extra[:50]))
+    with _lock:
+        if _scan["running"]:
+            return jsonify(ok=True, message="A scan is already running.")
+    threading.Thread(target=run_scan, args=(ports,), daemon=True).start()
+    return jsonify(ok=True, message="Scanning your network…")
+
+
+@app.get("/api/scan")
+def scan_status():
+    with _lock:
+        return jsonify(networks=[str(n) for n in lan_networks()], **_scan)
+
+
+def scan_host(host, extra_ports=()):
+    """Check one device for the common ports (plus any it had before). Returns open ports."""
+    known = load_devices().get(host, {}).get("ports", [])
+    ports = sorted(set(COMMON_PORTS) | set(known) | set(extra_ports))
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        results = list(pool.map(lambda p: _probe(host, p), ports))
+    return [p for p, ok in zip(ports, results) if ok]
+
+
+def port_info(host, port, tracked):
+    return {"port": port, "label": COMMON_PORTS.get(port, ""), "web": port in WEB_PORTS,
+            "tracked": (host, port) in tracked}
+
+
+@app.get("/api/devices")
+def list_devices():
+    """This PC plus every other device: scanned ones and hosts your services point at."""
+    stored = load_devices()
+    services = load_services()
+    tracked = {(s.get("host"), s.get("port")) for s in services if s.get("host")}
+    with _lock:
+        latest = dict(_latest)
+    hosts = list(stored) + [s["host"] for s in services if s.get("host") and s["host"] not in stored]
+    out = []
+    for host in dict.fromkeys(hosts):
+        d = stored.get(host, {})
+        mine = [s for s in services if s.get("host") == host]
+        ups = [latest[s["id"]]["up"] for s in mine if s["id"] in latest]
+        hostname = d.get("hostname")
+        out.append({
+            "host": host,
+            "name": d.get("label") or (hostname.split(".")[0] if hostname else None),
+            "hostname": hostname,
+            "label": d.get("label"),
+            "ports": [port_info(host, p, tracked) for p in d.get("ports", [])],
+            "last_seen": d.get("last_seen"),
+            "services": len(mine),
+            "up": sum(ups),
+            "status": "unknown" if not ups else ("up" if all(ups) else ("partial" if any(ups) else "down")),
+        })
+    def sort_key(d):
+        try:
+            return (0, ipaddress.ip_address(d["host"]))
+        except ValueError:
+            return (1, d["host"])
+    out.sort(key=sort_key)
+    pc_rows = [r for r in latest.values() if not r.get("host")]
+    return jsonify(
+        this_pc={"name": socket.gethostname(), "addresses": lan_addresses(),
+                 "services": len(pc_rows), "up": sum(1 for r in pc_rows if r["up"])},
+        devices=out,
+    )
+
+
+def _valid_host(host):
+    return re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,253}", host or "") is not None
+
+
+@app.post("/api/devices/<host>/scan")
+def rescan_device(host):
+    require_dashboard_header()
+    if not _valid_host(host):
+        abort(400)
+    body = request.get_json(silent=True) or {}
+    extra = [int(p) for p in re.findall(r"\d+", str(body.get("ports", ""))) if 1 <= int(p) <= 65535][:50]
+    open_ports = scan_host(host, extra)
+    if open_ports:
+        remember_devices({host: open_ports}, {host: _name_of(host)})
+    msg = (f"{len(open_ports)} open port{'s' if len(open_ports) != 1 else ''} on {host}." if open_ports
+           else f"No open ports answered on {host}. It may be off or blocking checks.")
+    return jsonify(ok=True, message=msg, ports=open_ports)
+
+
+@app.put("/api/devices/<host>")
+def rename_device(host):
+    require_dashboard_header()
+    label = str((request.get_json(silent=True) or {}).get("label", "")).strip()[:40]
+    with _lock:
+        devices = load_devices()
+        d = devices.setdefault(host, {"first_seen": time.time(), "ports": []})
+        if label:
+            d["label"] = label
+        else:
+            d.pop("label", None)
+        save_devices(devices)
+    return jsonify(ok=True, message=f"Renamed to {label}." if label else "Name reset.")
+
+
+@app.delete("/api/devices/<host>")
+def forget_device(host):
+    require_dashboard_header()
+    if any(s.get("host") == host for s in load_services()):
+        return jsonify(ok=False, message="Remove this device's services first, then forget it."), 400
+    with _lock:
+        devices = load_devices()
+        devices.pop(host, None)
+        save_devices(devices)
+    return jsonify(ok=True, message=f"Forgot {host}.")
+
+
+@app.get("/api/lookup")
+def lookup():
+    """What's listening on a local port, for filling in the add form."""
+    port = request.args.get("port", "")
+    if not port.isdigit():
+        return jsonify(found=False)
+    owner = port_owners().get(int(port))
+    return jsonify(found=bool(owner), **(owner or {}))
+
+
+@app.get("/api/winservices")
+def list_windows_services():
+    return jsonify([{k: s[k] for k in ("name", "display_name", "status")}
+                    for s in sorted(windows_services(), key=lambda s: s["display_name"].lower())])
+
+
+@app.post("/api/services/<sid>/use-service")
+def use_suggested_service(sid):
+    """Apply the Windows service name found for this tile's port."""
+    require_dashboard_header()
+    name = str((request.get_json(silent=True) or {}).get("service", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9 _.\-$]{1,80}", name):
+        abort(400)
+    with _lock:
+        services = load_services()
+        svc = next((s for s in services if s["id"] == sid), None)
+        if not svc or svc.get("host"):
+            abort(404)
+        svc["service"] = name
+        save_services(services)
+    threading.Thread(target=check_all, daemon=True).start()
+    return jsonify(ok=True, message=f"{svc['name']} now uses the Windows service {name}.")
 
 
 @app.get("/api/discover")

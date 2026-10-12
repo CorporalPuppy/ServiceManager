@@ -23,7 +23,16 @@ if not defined VENV (
     exit /b 1
 )
 
+rem Run in the system tray (no window). Fall back to a console window if the tray packages are missing.
+"%VENV%\Scripts\python.exe" -c "import pystray, PIL" >NUL 2>&1
+if %errorlevel% equ 0 (
+    rem tray.py opens the dashboard in your browser once it's ready
+    start "" "%VENV%\Scripts\pythonw.exe" tray.py
+    exit /b
+)
+
+echo Tray icon needs: pip install -r requirements.txt
 echo Dashboard running at http://localhost:8088  (close this window to stop it)
 start "" http://localhost:8088
-%VENV%\Scripts\waitress-serve.exe --listen=127.0.0.1:8088 app:app
+"%VENV%\Scripts\waitress-serve.exe" --listen=127.0.0.1:8088 app:app
 pause

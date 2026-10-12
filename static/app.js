@@ -41,6 +41,28 @@ function toast(text, isError) {
 }
 
 /* ---------- Rendering ---------- */
+// Link that opens a service. Uses the address it actually answered on, so services
+// that only listen on the network address (192.168.x.x) still open from localhost.
+function openUrl(s) {
+  if (!s.port) return s.public_url || null;
+  const host = s.open_host || location.hostname;
+  return 'http://' + host + ':' + s.port + (s.path || '/');
+}
+
+function renderQuick(rows) {
+  const bar = $('#quick');
+  const links = rows.filter((r) => openUrl(r));
+  bar.hidden = !links.length;
+  $('#quick-links').replaceChildren(...links.map((r) => {
+    const a = el('a', 'quick' + (r.up ? ' up' : '') + (r.pinned ? ' pinned' : ''));
+    a.href = openUrl(r); a.target = '_blank'; a.rel = 'noopener';
+    a.title = (r.up ? 'Open ' : 'Offline: ') + a.href;
+    a.append(el('span', 'qdot'), el('span', '', (r.pinned ? '★ ' : '') + r.name));
+    if (r.port) a.append(el('small', '', ':' + r.port));
+    return a;
+  }));
+}
+
 function historyStrip(history, size) {
   const strip = el('div', 'history');
   const max = Math.max(20, ...history.filter((v) => v != null));
@@ -59,7 +81,16 @@ function card(s, now) {
 
   const head = el('div', 'card-head');
   const title = el('div', 'card-title');
-  title.append(el('h3', '', s.name));
+  const url = openUrl(s);
+  if (url) {
+    const h = el('h3');
+    const link = el('a', 'title-link', s.name);
+    link.href = url; link.target = '_blank'; link.rel = 'noopener'; link.title = 'Open ' + url;
+    h.append(link);
+    title.append(h);
+  } else {
+    title.append(el('h3', '', s.name));
+  }
   if (s.group) title.append(el('div', 'group', s.group));
   const pin = el('button', 'pin' + (s.pinned ? ' on' : ''), s.pinned ? '★' : '☆');
   pin.title = s.pinned ? 'Unpin' : 'Pin to the top';
@@ -80,14 +111,31 @@ function card(s, now) {
   legend.append(el('span', '', ago(60 * window.CHECK_EVERY) + ' ago'), el('span', '', 'now'));
 
   const meta = el('div', 'meta');
+  if (s.host) { const h = el('span'); h.append('On ', el('code', '', s.host)); meta.append(h); }
   if (s.port) { const p = el('span'); p.append('Port ', el('code', '', s.port)); meta.append(p); }
   if (s.state) meta.append(el('span', '', 'Service ' + s.state));
+
+  // The dashboard spotted which Windows service owns this port: offer to use it.
+  let suggestion = null;
+  if (s.suggested_service) {
+    suggestion = el('div', 'suggest');
+    suggestion.append(el('span', '', (s.state === 'not installed' ? 'Wrong service name? ' : 'Found the Windows service: ') +
+      s.suggested_service.display_name + ' (' + s.suggested_service.service + ')'));
+    const use = el('button', 'mini primary', 'Use it');
+    use.onclick = async () => {
+      use.disabled = true;
+      const res = await send('POST', '/api/services/' + encodeURIComponent(s.id) + '/use-service', { service: s.suggested_service.service });
+      toast(res.message || 'Could not update it.', !res.ok);
+      setTimeout(refresh, 800);
+    };
+    suggestion.append(use);
+  }
   if (s.avg_latency != null) meta.append(el('span', '', 'Avg ' + ms(s.avg_latency)));
 
   const actions = el('div', 'actions');
   if (s.port) {
     const a = el('a', 'btn primary', 'Open');
-    a.href = 'http://' + location.hostname + ':' + s.port + s.path;
+    a.href = openUrl(s);
     a.target = '_blank'; a.rel = 'noopener';
     actions.append(a);
   }
@@ -111,18 +159,21 @@ function card(s, now) {
   if (!s.controllable) actions.append(el('span', 'spacer'));
   actions.append(edit);
 
-  c.append(head, metrics, strip, legend, meta, actions);
+  c.append(head, metrics, strip, legend, meta);
+  if (suggestion) c.append(suggestion);
+  c.append(actions);
   return c;
 }
 
 function render() {
   if (!data) return;
-  const rows = data.services;
+  // Each device page shows only its own services; This PC shows the ones without a host.
+  const rows = data.services.filter((r) => (currentDevice ? r.host === currentDevice : !r.host));
   const now = data.now;
   const up = rows.filter((r) => r.up).length;
   const down = rows.length - up;
+  const allDown = data.services.filter((r) => !r.up).length;
 
-  $('#host').textContent = data.host;
   $('#stat-up').textContent = up + ' / ' + rows.length;
   $('#stat-down').textContent = down;
   $('#stat-down').classList.toggle('has', down > 0);
@@ -130,16 +181,19 @@ function render() {
   $('#stat-uptime').textContent = rows.length ? avgUp.toFixed(1) + '%' : '–';
   const lat = rows.filter((r) => r.latency != null).map((r) => r.latency);
   $('#stat-latency').textContent = lat.length ? ms(lat.reduce((a, b) => a + b, 0) / lat.length) : '–';
-  $('#overall-dot').className = 'brand-mark ' + (rows.length ? (down ? 'bad' : 'ok') : '');
-  document.title = (down ? `(${down} down) ` : '') + 'Services';
+  $('#overall-dot').className = 'brand-mark ' + (data.services.length ? (allDown ? 'bad' : 'ok') : '');
+  document.title = (allDown ? `(${allDown} down) ` : '') + 'Services';
 
   const q = $('#search').value.trim().toLowerCase();
   const visible = rows.filter((r) =>
     (filter === 'all' || (filter === 'pinned' ? r.pinned : (filter === 'up') === r.up)) &&
     (!q || (r.name + ' ' + (r.group || '') + ' ' + (r.port || '')).toLowerCase().includes(q)));
   grid.replaceChildren(...visible.map((r) => card(r, now)));
+  renderQuick(rows);
   $('#empty').hidden = visible.length > 0;
-  $('#empty').textContent = filter === 'pinned' && !q ? 'Nothing pinned yet. Click the ☆ on a service to pin it here.' : 'No services match.';
+  $('#empty').textContent = filter === 'pinned' && !q ? 'Nothing pinned yet. Click the ☆ on a service to pin it here.'
+    : !rows.length && currentDevice ? 'No services tracked on this device yet. Add one from its open ports below.'
+    : 'No services match.';
   const pinnedCount = rows.filter((r) => r.pinned).length;
   $('#count-pinned').textContent = pinnedCount || '';
 
@@ -151,6 +205,151 @@ function render() {
       return li;
     }));
   }
+}
+
+/* ---------- Devices sidebar and pages ---------- */
+let currentDevice = null;   // null = This PC, otherwise the device's host (IP or name)
+let devicesData = null;
+
+function routeFromHash() {
+  const m = location.hash.match(/^#\/device\/(.+)$/);
+  currentDevice = m ? decodeURIComponent(m[1]) : null;
+}
+
+function deviceTitle(d) {
+  return d.name || d.host;
+}
+
+function statusClass(status) {
+  return { up: 'ok', partial: 'warn', down: 'bad' }[status] || '';
+}
+
+function renderSidebar() {
+  const nav = $('#device-nav');
+  if (!devicesData) return;
+  const pc = devicesData.this_pc;
+  const items = [];
+  const pcItem = el('a', 'dev-item' + (!currentDevice ? ' active' : ''));
+  pcItem.href = '#/';
+  const pcStatus = pc.services ? (pc.up === pc.services ? 'up' : pc.up ? 'partial' : 'down') : 'unknown';
+  pcItem.append(el('span', 'dev-dot ' + statusClass(pcStatus)));
+  const pcText = el('span', 'dev-text');
+  pcText.append(el('b', '', 'This PC'), el('small', '', pc.name + (pc.services ? ' · ' + pc.up + '/' + pc.services + ' up' : '')));
+  pcItem.append(pcText);
+  items.push(pcItem);
+
+  for (const d of devicesData.devices) {
+    const a = el('a', 'dev-item' + (currentDevice === d.host ? ' active' : ''));
+    a.href = '#/device/' + encodeURIComponent(d.host);
+    a.append(el('span', 'dev-dot ' + statusClass(d.status)));
+    const t = el('span', 'dev-text');
+    const detail = d.services ? d.up + '/' + d.services + ' up' : d.ports.length + ' open port' + (d.ports.length === 1 ? '' : 's');
+    t.append(el('b', '', deviceTitle(d)), el('small', '', d.host + ' · ' + detail));
+    a.append(t);
+    items.push(a);
+  }
+  if (!devicesData.devices.length) items.push(el('p', 'side-note', 'No other devices yet. Scan your network to find them.'));
+  nav.replaceChildren(...items);
+}
+
+function renderDevicePage() {
+  const d = currentDevice && devicesData ? devicesData.devices.find((x) => x.host === currentDevice) : null;
+  $('#dev-actions').hidden = !currentDevice;
+  $('#dev-ports').hidden = !currentDevice;
+  $('#discover-btn').hidden = !!currentDevice;
+  if (!currentDevice) {
+    $('#page-title').textContent = 'This PC';
+    $('#host').textContent = devicesData ? devicesData.this_pc.name : '';
+    return;
+  }
+  $('#page-title').textContent = d ? deviceTitle(d) : currentDevice;
+  $('#host').textContent = currentDevice + (d && d.hostname && d.name !== d.hostname ? ' · ' + d.hostname : '') +
+    (d && d.last_seen ? ' · last scanned ' + ago(Date.now() / 1000 - d.last_seen) + ' ago' : '');
+  const ports = d ? d.ports : [];
+  $('#dev-ports-sub').textContent = ports.length ? 'Found by the last scan. Add one to track it.' : 'None found yet. Click Rescan ports.';
+  $('#dev-ports-list').replaceChildren(...ports.map((p) => {
+    const row = el('div', 'disc-row' + (p.tracked ? ' tracked' : ''));
+    const main = el('div', 'disc-main');
+    main.append(el('b', '', p.label || 'Open port'), el('span', '', p.web ? 'Web page' : 'Not a web page'));
+    const actions = el('div', 'row-actions');
+    if (p.web) {
+      const a = el('a', 'btn', 'Open');
+      a.href = ([443, 8443, 9443, 5001, 8920].includes(p.port) ? 'https://' : 'http://') + currentDevice + ':' + p.port + '/';
+      a.target = '_blank'; a.rel = 'noopener';
+      actions.append(a);
+    }
+    const add = el('button', 'btn ' + (p.tracked ? '' : 'primary'), p.tracked ? 'Tracked' : 'Add');
+    add.disabled = p.tracked;
+    add.onclick = () => openDialog(null, { name: p.label || 'Port ' + p.port, host: currentDevice, port: p.port });
+    actions.append(add);
+    row.append(el('span', 'disc-port', p.port), main, actions);
+    return row;
+  }));
+}
+
+async function loadDevices() {
+  try {
+    devicesData = await (await fetch('/api/devices', { cache: 'no-store' })).json();
+  } catch (e) { return; }
+  renderSidebar();
+  renderDevicePage();
+}
+
+function go() {
+  routeFromHash();
+  filter = 'all';
+  document.querySelectorAll('.chip[data-filter]').forEach((x) => x.classList.toggle('active', x.dataset.filter === 'all'));
+  render();
+  renderSidebar();
+  renderDevicePage();
+  refreshSystem();
+  window.scrollTo(0, 0);
+}
+window.addEventListener('hashchange', go);
+
+$('#dev-rescan').onclick = async () => {
+  const b = $('#dev-rescan');
+  b.disabled = true; b.textContent = 'Scanning…';
+  try {
+    const res = await send('POST', '/api/devices/' + encodeURIComponent(currentDevice) + '/scan', {});
+    toast(res.message, !res.ok);
+  } finally {
+    b.disabled = false; b.textContent = 'Rescan ports';
+    loadDevices();
+  }
+};
+$('#dev-rename').onclick = async () => {
+  const d = devicesData && devicesData.devices.find((x) => x.host === currentDevice);
+  const label = prompt('Name for ' + currentDevice + ' (leave empty to use its network name):', (d && d.label) || '');
+  if (label === null) return;
+  const res = await send('PUT', '/api/devices/' + encodeURIComponent(currentDevice), { label });
+  toast(res.message, !res.ok);
+  loadDevices();
+};
+$('#dev-forget').onclick = async () => {
+  if (!confirm('Remove ' + currentDevice + ' from the sidebar? A future scan will find it again if it is still on.')) return;
+  const res = await send('DELETE', '/api/devices/' + encodeURIComponent(currentDevice));
+  toast(res.message, !res.ok);
+  if (res.ok) location.hash = '#/';
+  loadDevices();
+};
+
+// Sidebar "Scan network" uses the same scan as Discover › Network.
+$('#side-scan').onclick = async () => {
+  const res = await send('POST', '/api/scan', {});
+  if (!res.ok) return toast(res.message || 'Could not start the scan.', true);
+  setTimeout(pollScan, 300);
+};
+
+function renderSideScan() {
+  const sd = scanData;
+  if (!sd) return;
+  $('#side-scan').disabled = sd.running;
+  $('#side-scan').textContent = sd.running ? 'Scanning…' : 'Scan network';
+  $('#side-meter').hidden = !sd.running;
+  $('#side-fill').style.width = (sd.total ? (100 * sd.done) / sd.total : 0) + '%';
+  $('#side-note').textContent = sd.running ? 'Checking ' + (sd.networks.join(', ') || 'your network') + '…'
+    : sd.finished ? 'Last scan ' + ago(Date.now() / 1000 - sd.finished) + ' ago.' : 'Finds other computers on your network.';
 }
 
 /* ---------- Data ---------- */
@@ -216,7 +415,7 @@ async function openDialog(id, prefill) {
     try {
       const all = await (await fetch('/api/services', { cache: 'no-store' })).json();
       const svc = all.find((x) => x.id === id) || {};
-      for (const key of ['name', 'port', 'group', 'service', 'path', 'public_url']) {
+      for (const key of ['name', 'host', 'port', 'group', 'service', 'path', 'public_url']) {
         if (svc[key] != null) form.elements[key].value = svc[key];
       }
     } catch (e) { toast('Could not load that service.', true); return; }
@@ -224,6 +423,8 @@ async function openDialog(id, prefill) {
   for (const [key, value] of Object.entries(prefill || {})) {
     if (value != null && form.elements[key]) form.elements[key].value = value;
   }
+  found('');
+  loadWinServices();
   dialog.showModal();
   form.elements.name.focus();
 }
@@ -238,6 +439,47 @@ async function send(method, url, body) {
   try { res = await r.json(); } catch (e) { res = { ok: false, message: 'Request failed (' + r.status + ').' }; }
   return res;
 }
+
+/* Fill in the Windows service name automatically */
+let winServices = null;
+
+async function loadWinServices() {
+  if (winServices) return winServices;
+  try { winServices = await (await fetch('/api/winservices', { cache: 'no-store' })).json(); } catch (e) { winServices = []; }
+  $('#svc-options').replaceChildren(...winServices.map((w) => {
+    const o = document.createElement('option');
+    o.value = w.name;
+    o.label = w.display_name + (w.status === 'running' ? '' : ' (' + w.status + ')');
+    return o;
+  }));
+  return winServices;
+}
+
+function found(text) {
+  $('#svc-found').textContent = text || '';
+  $('#svc-found').hidden = !text;
+}
+
+// Typing a port looks up what's listening there and fills in the service name (and name, if blank).
+form.elements.port.addEventListener('change', async () => {
+  const port = form.elements.port.value.trim();
+  found('');
+  if (!/^\d+$/.test(port) || form.elements.host.value.trim()) return;
+  try {
+    const r = await (await fetch('/api/lookup?port=' + port, { cache: 'no-store' })).json();
+    if (!r.found) return found('Nothing is listening on port ' + port + ' right now.');
+    if (r.service && !form.elements.service.value) form.elements.service.value = r.service;
+    if (!form.elements.name.value) form.elements.name.value = r.display_name || niceName(r.process);
+    found('Port ' + port + ' belongs to ' + (r.display_name ? r.display_name + ' (service ' + r.service + ')' : (r.process || 'an unknown program') + ', which isn\'t a Windows service'));
+  } catch (e) { /* lookup is a convenience; ignore failures */ }
+});
+
+// Picking a service from the list fills in a name if there isn't one.
+form.elements.service.addEventListener('change', async () => {
+  const list = await loadWinServices();
+  const w = list.find((x) => x.name.toLowerCase() === form.elements.service.value.trim().toLowerCase());
+  if (w && !form.elements.name.value) form.elements.name.value = w.display_name;
+});
 
 form.onsubmit = async (ev) => {
   ev.preventDefault();
@@ -271,7 +513,7 @@ $('#svc-remove').onclick = async () => {
 
 dialog.querySelectorAll('[data-close]').forEach((b) => (b.onclick = () => dialog.close()));
 dialog.addEventListener('click', (ev) => { if (ev.target === dialog) dialog.close(); });
-$('#add-btn').onclick = () => openDialog(null);
+$('#add-btn').onclick = () => openDialog(null, currentDevice ? { host: currentDevice } : null);
 
 /* ---------- Discover ---------- */
 const disc = $('#disc-dialog');
@@ -297,6 +539,9 @@ function discRow(lead, leadCls, title, tags, detail, tracked, prefill) {
 }
 
 function renderDiscover() {
+  $('#scan-bar').hidden = discTab !== 'network';
+  disc.querySelectorAll('.local-only').forEach((x) => (x.hidden = discTab === 'network'));
+  if (discTab === 'network') return renderNetwork();
   if (!discData) return;
   const showSystem = $('#disc-system').checked;
   const q = $('#disc-search').value.trim().toLowerCase();
@@ -335,6 +580,99 @@ function renderDiscover() {
   list.replaceChildren(...(rows.length ? rows : [el('p', 'disc-empty', q ? 'Nothing matches.' : 'Nothing found.')]));
 }
 
+/* Network tab: other computers on the LAN */
+let scanData = null;
+let selDevice = null;
+let scanTimer = null;
+
+function renderNetwork() {
+  const list = $('#disc-list');
+  const sd = scanData;
+  if (!sd) { list.replaceChildren(); return; }
+  const running = sd.running;
+  $('#scan-btn').disabled = running;
+  $('#scan-btn').textContent = running ? 'Scanning…' : sd.finished ? 'Scan again' : 'Scan network';
+  $('#scan-meter').hidden = !running;
+  $('#scan-fill').style.width = (sd.total ? (100 * sd.done) / sd.total : 0) + '%';
+  $('#scan-title').textContent = running ? 'Scanning ' + (sd.networks.join(', ') || 'your network') + '…'
+    : sd.finished ? 'Found ' + sd.devices.length + ' device' + (sd.devices.length === 1 ? '' : 's') + ' with open ports'
+    : 'Find other devices on your network';
+  if (sd.finished && !running) {
+    $('#scan-sub').textContent = 'Scanned ' + sd.networks.join(', ') + ' ' + ago(Date.now() / 1000 - sd.finished) + ' ago. Click a port to track it.';
+  }
+  $('#count-network').textContent = sd.finished ? sd.devices.length : '';
+  if (sd.error) { list.replaceChildren(el('p', 'disc-empty', sd.error)); return; }
+
+  const q = $('#disc-search').value.trim().toLowerCase();
+  const devices = sd.devices.filter((d) => !q ||
+    [d.ip, d.name, ...d.ports.map((p) => p.port + ' ' + p.label)].join(' ').toLowerCase().includes(q));
+  if (!devices.length) {
+    list.replaceChildren(el('p', 'disc-empty', running ? 'Looking…' : sd.finished ? (q ? 'Nothing matches.' : 'No other devices answered.') : ''));
+    return;
+  }
+  // One tab per device on the left, that device's ports on the right.
+  if (!devices.some((d) => d.ip === selDevice)) selDevice = devices[0].ip;
+  const tabs = el('div', 'device-tabs');
+  for (const d of devices) {
+    const tab = el('button', 'device-tab' + (d.ip === selDevice ? ' active' : ''));
+    tab.append(el('b', '', deviceName(d)), el('span', '', d.ip + ' · ' + d.ports.length + ' port' + (d.ports.length === 1 ? '' : 's')));
+    tab.onclick = () => { selDevice = d.ip; renderNetwork(); };
+    tabs.append(tab);
+  }
+  const d = devices.find((x) => x.ip === selDevice);
+  const panel = el('div', 'device-panel');
+  const head = el('div', 'device-head');
+  head.append(el('h3', '', deviceName(d)), el('code', '', d.ip + (d.name ? ' · ' + d.name : '')));
+  panel.append(head);
+  for (const p of d.ports) {
+    const row = el('div', 'disc-row' + (p.tracked ? ' tracked' : ''));
+    const main = el('div', 'disc-main');
+    main.append(el('b', '', p.label || 'Open port'), el('span', '', p.web ? 'Web page' : 'Not a web page'));
+    const actions = el('div', 'row-actions');
+    if (p.web) {
+      const a = el('a', 'btn', 'Open');
+      a.href = ([443, 8443, 9443, 5001, 8920].includes(p.port) ? 'https://' : 'http://') + d.ip + ':' + p.port + '/';
+      a.target = '_blank'; a.rel = 'noopener';
+      actions.append(a);
+    }
+    const add = el('button', 'btn ' + (p.tracked ? '' : 'primary'), p.tracked ? 'Added' : 'Add');
+    add.disabled = p.tracked;
+    const device = deviceName(d);
+    add.onclick = () => {
+      disc.close();
+      openDialog(null, { name: (p.label ? p.label + ' on ' : 'Port ' + p.port + ' on ') + device, host: d.ip, port: p.port, group: device });
+    };
+    actions.append(add);
+    row.append(el('span', 'disc-port', p.port), main, actions);
+    panel.append(row);
+  }
+  const wrap = el('div', 'device-split');
+  wrap.append(tabs, panel);
+  list.replaceChildren(wrap);
+}
+
+function deviceName(d) {
+  return d.name ? d.name.split('.')[0] : 'Unknown device';
+}
+
+async function pollScan() {
+  try {
+    scanData = await (await fetch('/api/scan', { cache: 'no-store' })).json();
+  } catch (e) { return; }
+  if (discTab === 'network') renderNetwork();
+  else $('#count-network').textContent = scanData.finished ? scanData.devices.length : '';
+  renderSideScan();
+  clearTimeout(scanTimer);
+  if (scanData.running) scanTimer = setTimeout(pollScan, 700);
+  else loadDevices();
+}
+
+$('#scan-btn').onclick = async () => {
+  const res = await send('POST', '/api/scan', { ports: $('#scan-ports').value });
+  if (!res.ok) return toast(res.message || 'Could not start the scan.', true);
+  setTimeout(pollScan, 300);
+};
+
 async function scan() {
   $('#disc-sub').textContent = 'Scanning this PC…';
   try {
@@ -362,7 +700,7 @@ disc.addEventListener('click', (ev) => { if (ev.target === disc) disc.close(); }
 $('#disc-search').oninput = renderDiscover;
 $('#disc-system').onchange = renderDiscover;
 $('#disc-rescan').onclick = scan;
-$('#discover-btn').onclick = () => { disc.showModal(); scan(); };
+$('#discover-btn').onclick = () => { disc.showModal(); scan(); pollScan(); };
 
 /* ---------- System stats ---------- */
 function bytes(n, perSecond) {
@@ -394,6 +732,12 @@ function spark(svg, series, maxSlots) {
 }
 
 function renderSystem(sys) {
+  if (currentDevice) {  // CPU, memory and processes are only known for this PC
+    $('#system').hidden = true;
+    $('#procs-panel').hidden = true;
+    $('#system-missing').hidden = true;
+    return;
+  }
   if (!sys.available) {
     $('#system').hidden = true;
     $('#procs-panel').hidden = true;
@@ -464,5 +808,9 @@ document.querySelectorAll('.chip[data-filter]').forEach((c) => (c.onclick = () =
 }));
 $('#search').oninput = render;
 
+routeFromHash();
 refresh();
+loadDevices();
+pollScan();
 setInterval(refresh, window.CHECK_EVERY * 1000);
+setInterval(loadDevices, window.CHECK_EVERY * 1000);

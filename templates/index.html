@@ -8,22 +8,49 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+<div class="app">
+<aside class="sidebar" aria-label="Devices">
+  <div class="side-brand">
+    <span class="brand-mark" id="overall-dot"></span>
+    <div>
+      <b>Service dashboard</b>
+      <span class="sub">checks every {{ check_every }}s</span>
+    </div>
+  </div>
+  <div class="side-label">Devices</div>
+  <nav class="device-nav" id="device-nav"></nav>
+  <div class="side-foot">
+    <button class="btn side-scan" id="side-scan">Scan network</button>
+    <div class="meter scan-meter" id="side-meter" hidden><i id="side-fill"></i></div>
+    <p class="side-note" id="side-note">Finds other computers on your network.</p>
+  </div>
+</aside>
+
 <div class="shell">
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" id="overall-dot"></span>
       <div>
-        <h1>Services</h1>
-        <p class="sub"><span id="host">This PC</span> · checks every {{ check_every }}s</p>
+        <h1 id="page-title">This PC</h1>
+        <p class="sub" id="page-sub"><span id="host"></span></p>
       </div>
     </div>
     <div class="topbar-right">
+      <div class="dev-actions" id="dev-actions" hidden>
+        <button class="btn" id="dev-rescan">Rescan ports</button>
+        <button class="btn" id="dev-rename">Rename</button>
+        <button class="btn ghost" id="dev-forget">Forget</button>
+      </div>
       <span class="live"><span class="live-dot"></span><span id="updated">Connecting…</span></span>
       <button class="icon-btn" id="theme-btn" title="Switch light / dark" aria-label="Switch light or dark theme">
         <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
       </button>
     </div>
   </header>
+
+  <nav class="quickbar" id="quick" hidden aria-label="Quick open">
+    <span class="quick-label">Quick open</span>
+    <div class="quick-links" id="quick-links"></div>
+  </nav>
 
   <section class="stats">
     <div class="stat"><span class="stat-label">Online</span><span class="stat-value" id="stat-up">–</span></div>
@@ -75,6 +102,14 @@
       </div>
       <div id="grid" class="grid"></div>
       <p id="empty" class="empty-note" hidden>No services match.</p>
+
+      <section class="ports-section" id="dev-ports" hidden>
+        <div class="section-head">
+          <h2>Open ports</h2>
+          <span class="sub" id="dev-ports-sub"></span>
+        </div>
+        <div class="ports-list" id="dev-ports-list"></div>
+      </section>
     </main>
 
     <aside class="side">
@@ -93,6 +128,8 @@
   </div>
 </div>
 
+</div><!-- .app -->
+
 <dialog id="svc-dialog" class="dialog">
   <form id="svc-form" method="dialog" novalidate>
     <header class="dialog-head">
@@ -103,6 +140,10 @@
       <label class="field wide"><span>Name <span class="req">*</span></span>
         <input name="name" required maxlength="60" placeholder="e.g. Jellyfin">
       </label>
+      <label class="field"><span>Host</span>
+        <input name="host" placeholder="Leave empty for this PC">
+        <small>Another computer's IP or name, like 192.168.1.50.</small>
+      </label>
       <label class="field"><span>Port</span>
         <input name="port" inputmode="numeric" placeholder="e.g. 8096">
         <small>Checked to see if it's up.</small>
@@ -110,9 +151,10 @@
       <label class="field"><span>Group</span>
         <input name="group" maxlength="40" placeholder="e.g. Media">
       </label>
-      <label class="field wide"><span>Windows service name</span>
-        <input name="service" placeholder="e.g. JellyfinServer">
-        <small>Optional. Turns on Start / Stop / Restart. Find it in services.msc.</small>
+      <label class="field"><span>Windows service name</span>
+        <input name="service" placeholder="Start typing to search" list="svc-options" autocomplete="off">
+        <datalist id="svc-options"></datalist>
+        <small>Optional, this PC only. Turns on Start / Stop.</small>
       </label>
       <label class="field"><span>Path</span>
         <input name="path" placeholder="/">
@@ -122,6 +164,7 @@
         <input name="public_url" placeholder="https://…">
       </label>
     </div>
+    <p id="svc-found" class="form-found" hidden></p>
     <p id="svc-error" class="form-error" hidden></p>
     <footer class="dialog-foot">
       <button type="button" class="btn danger" id="svc-remove" hidden>Remove</button>
@@ -145,10 +188,20 @@
       <div class="filters" role="tablist">
         <button class="chip active" data-tab="ports">Listening ports <span class="count" id="count-ports"></span></button>
         <button class="chip" data-tab="services">Windows services <span class="count" id="count-services"></span></button>
+        <button class="chip" data-tab="network">Network <span class="count" id="count-network"></span></button>
       </div>
       <input class="search" id="disc-search" type="search" placeholder="Filter…" autocomplete="off">
-      <label class="check"><input type="checkbox" id="disc-system"> Show Windows' own</label>
-      <button class="btn" id="disc-rescan">Rescan</button>
+      <label class="check local-only"><input type="checkbox" id="disc-system"> Show Windows' own</label>
+      <button class="btn local-only" id="disc-rescan">Rescan</button>
+    </div>
+    <div class="scan-bar" id="scan-bar" hidden>
+      <div class="scan-info">
+        <b id="scan-title">Find other devices on your network</b>
+        <span id="scan-sub">Checks every address on your home network for common ports (web pages, SSH, Plex, Home Assistant, and so on).</span>
+      </div>
+      <input class="search scan-ports" id="scan-ports" placeholder="Extra ports, e.g. 7000, 25565" autocomplete="off">
+      <button class="btn primary solid" id="scan-btn">Scan network</button>
+      <div class="meter scan-meter" hidden id="scan-meter"><i id="scan-fill"></i></div>
     </div>
     <div class="disc-list" id="disc-list"></div>
   </div>

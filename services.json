@@ -1,29 +1,18 @@
 [
   {
-    "id": "jellyfin",
-    "name": "Jellyfin",
-    "port": 8096,
-    "service": "JellyfinServer"
-  },
-  {
     "id": "syncthing",
     "name": "Syncthing",
     "port": 8384
   },
   {
-    "id": "lhm",
-    "name": "Libre Hardware Monitor",
-    "port": 8085
+    "id": "jellyfin",
+    "name": "Jellyfin",
+    "port": 8096
   },
   {
-    "id": "mysite",
-    "name": "My Flask site",
-    "port": 8000,
-    "service": "MySite"
-  },
-  {
-    "id": "cloudflared",
-    "name": "Cloudflare Tunnel",
+    "id": "cloudflared-agent",
+    "name": "Cloudflared agent",
+    "port": 20241,
     "service": "Cloudflared"
   }
 ]
